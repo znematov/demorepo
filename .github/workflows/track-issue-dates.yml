@@ -1,0 +1,213 @@
+  name: Track Issue Dates to Wiki
+  
+  on:
+    issues:
+      types: [opened, assigned, closed]
+
+  permissions:
+    contents: write
+
+  jobs:
+    update-wiki:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Clone wiki
+          run: |
+            git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git wiki
+
+        - name: Get iteration from Project
+          id: get-iteration
+          env:
+            GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          run: |
+            ITERATION=$(gh api graphql -f query='
+              query($owner: String!, $repo: String!, $issue: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $issue) {
+                    projectItems(first: 10) {
+                      nodes {
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldIterationValue {
+                              title
+                              startDate
+                              duration
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ' -f owner="${{ github.repository_owner }}" \
+              -f repo="${{ github.event.repository.name }}" \
+              -F issue=${{ github.event.issue.number }} \
+              --jq '.data.repository.issue.projectItems.nodes[0].fieldValues.nodes[] | select(.title != null) | .title' 2>/dev/null || echo "")
+
+            echo "iteration=${ITERATION:-Unassigned}" >> $GITHUB_OUTPUT
+
+        - name: Setup Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.x'
+
+        - name: Update wiki table
+          env:
+            ITERATION: ${{ steps.get-iteration.outputs.iteration }}
+          run: |
+            cd wiki
+            python3 << 'EOF'
+            import os
+            import json
+            from datetime import datetime
+            from collections import defaultdict
+
+            issue_num = "#${{ github.event.issue.number }}"
+            repo = "${{ github.repository }}"
+            title = "${{ github.event.issue.title }}".replace("|", "-").replace("\n", " ")[:50]
+            action = "${{ github.event.action }}"
+            assignee = "${{ github.event.assignee.login }}" if "${{ github.event.assignee.login }}" != "" else ""
+            iteration = os.environ.get("ITERATION", "Unassigned")
+
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+
+            DATA_FILE = "issue-data.json"
+
+            if os.path.exists(DATA_FILE):
+                with open(DATA_FILE, "r") as f:
+                    data = json.load(f)
+            else:
+                data = {}
+
+            key = f"{repo}#{issue_num}"
+
+            if key not in data:
+                data[key] = {
+                    "issue": issue_num,
+                    "repo": repo,
+                    "title": title,
+                    "assignee": "",
+                    "iteration": iteration,
+                    "opened": "",
+                    "assigned": "",
+                    "closed": ""
+                }
+
+            data[key]["iteration"] = iteration
+            data[key]["title"] = title
+
+            if action == "opened":
+                data[key]["opened"] = today
+            elif action == "assigned":
+                data[key]["assignee"] = assignee
+                if not data[key].get("assigned"):
+                    data[key]["assigned"] = today
+            elif action == "closed":
+                data[key]["closed"] = today
+
+            with open(DATA_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+
+            def calc_cycle_time(assigned, closed):
+                if not assigned or not closed:
+                    return "N/A"
+                try:
+                    assigned_date = datetime.strptime(assigned, "%Y-%m-%d")
+                    closed_date = datetime.strptime(closed, "%Y-%m-%d")
+                    delta = (closed_date - assigned_date).days
+                    if delta == 0:
+                        return "< 1 day"
+                    elif delta == 1:
+                        return "1 day"
+                    else:
+                        return f"{delta} days"
+                except:
+                    return "N/A"
+
+            grouped = defaultdict(list)
+            for issue_key, issue in data.items():
+                iter_name = issue.get("iteration") or "Unassigned"
+                grouped[iter_name].append(issue)
+
+            def sort_key(iter_name):
+                if iter_name == "Unassigned":
+                    return "zzz"
+                return iter_name
+
+            sorted_iterations = sorted(grouped.keys(), key=sort_key, reverse=True)
+
+            md_lines = ["# Issue Tracking by Iteration\n\n"]
+
+            for iter_name in sorted_iterations:
+                issues = grouped[iter_name]
+
+                assigned_issues = [i for i in issues if i.get("assigned") and not i.get("closed")]
+                closed_issues = [i for i in issues if i.get("closed")]
+
+                assigned_issues = sorted(assigned_issues, key=lambda x: x.get("assigned") or "")
+                closed_issues = sorted(closed_issues, key=lambda x: x.get("closed") or "")
+
+                cycle_times = []
+                for issue in closed_issues:
+                    if issue.get("assigned") and issue.get("closed"):
+                        try:
+                            assigned_date = datetime.strptime(issue["assigned"], "%Y-%m-%d")
+                            closed_date = datetime.strptime(issue["closed"], "%Y-%m-%d")
+                            cycle_times.append((closed_date - assigned_date).days)
+                        except:
+                            pass
+
+                avg_cycle = f"{sum(cycle_times) / len(cycle_times):.1f} days" if cycle_times else "N/A"
+
+                md_lines.append(f"## {iter_name}\n\n")
+
+                total = len(issues)
+                completed = len(closed_issues)
+                in_progress = len(assigned_issues)
+                md_lines.append(f"**Total:** {total} | **In Progress:** {in_progress} | **Completed:** {completed} | **Avg Cycle Time:** {avg_cycle}\n\n")
+
+                md_lines.append("### 📋 Assigned (In Progress)\n\n")
+                if assigned_issues:
+                    md_lines.append("| Issue | Repo | Title | Assignee | Opened | Assigned |\n")
+                    md_lines.append("|-------|------|-------|----------|--------|----------|\n")
+                    for issue in assigned_issues:
+                        md_lines.append(
+                            f"| {issue['issue']} | {issue['repo']} | {issue['title']} | "
+                            f"{issue['assignee']} | {issue['opened']} | {issue['assigned']} |\n"
+                        )
+                else:
+                    md_lines.append("*No issues in progress*\n")
+
+                md_lines.append("\n")
+
+                md_lines.append("### ✅ Closed (Completed)\n\n")
+                if closed_issues:
+                    md_lines.append("| Issue | Repo | Title | Assignee | Opened | Assigned | Closed | Cycle Time |\n")
+                    md_lines.append("|-------|------|-------|----------|--------|----------|--------|------------|\n")
+                    for issue in closed_issues:
+                        cycle_time = calc_cycle_time(issue.get("assigned"), issue.get("closed"))
+                        md_lines.append(
+                            f"| {issue['issue']} | {issue['repo']} | {issue['title']} | "
+                            f"{issue['assignee']} | {issue['opened']} | {issue['assigned']} | "
+                            f"{issue['closed']} | {cycle_time} |\n"
+                        )
+                else:
+                    md_lines.append("*No completed issues*\n")
+
+                md_lines.append("\n---\n\n")
+
+            with open("Issue-Tracking.md", "w") as f:
+                f.writelines(md_lines)
+
+            print(f"Updated: {issue_num} - {action} - Iteration: {iteration}")
+            EOF
+
+        - name: Push to wiki
+          run: |
+            cd wiki
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .
+            git diff --staged --quiet || git commit -m "Update issue #${{ github.event.issue.number }} - ${{ github.event.action }}"
+            git push
